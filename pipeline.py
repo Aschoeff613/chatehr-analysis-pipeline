@@ -1,15 +1,15 @@
 """
 ChatEHR query classification pipeline.
 
-Raw ChatEHR queries go in. Two labels come out for each one:
+Raw ChatEHR queries go in. Medical labels and cognitive annotations come out:
 
   MEDICAL layer (the what) - replicates Appendix C.1 of Shah et al.,
     "Adoption and Use of LLMs at an Academic Medical Center"
-    (arXiv:2602.00074). Prompt is word for word from the paper.
+    (arXiv:2602.00074). Prompt follows the published appendix.
 
   COGNITIVE layer (the why) - the PACT cognitive classifier, run in two
-    passes: a deductive pass that maps each query to a defined task, and an
-    optional inductive pass that lets the model name what it sees without
+    passes: a deductive pass that assesses fit to defined tasks, and an
+    independent inductive pass that lets the model name what it sees without
     ever being shown the task list.
 
 Run `python pipeline.py --help` for options, or read README.md.
@@ -42,7 +42,7 @@ import pandas as pd
 # The paper used "gpt-4.1". Change this to whatever model you are using.
 MODEL = os.environ.get("CHATEHR_MODEL", "gpt-4.1")
 
-# Temperature 0 so the same query always gets the same label.
+# Temperature 0 reduces sampling variability; it does not guarantee determinism.
 # The paper does not state a temperature. Note this choice in your Methods.
 TEMPERATURE = 0.0
 
@@ -67,6 +67,14 @@ CONCURRENCY = 8
 # Rows whose reply could not be parsed are reported under this label rather
 # than dropped, so every distribution sums to the number of queries.
 UNLABELED = "(unlabeled: no valid reply)"
+FIT_STATUSES = ("matched", "no_adequate_fit", "insufficient_context", "nonclinical")
+STATUS_LABELS = {
+    "no_adequate_fit": "(no adequate taxonomy fit)",
+    "insufficient_context": "(insufficient context)",
+    "nonclinical": "(nonclinical)",
+    "invalid_response": UNLABELED,
+}
+VALIDATION_VERSION = 1
 
 HERE = Path(__file__).parent
 PROMPT_MEDICAL = HERE / "prompt_c1_medical_task_normalization.txt"
@@ -275,7 +283,108 @@ def parse_json_reply(text: str) -> dict:
     return {"_parse_error": text}
 
 
-def call_one(client, prompt_template: str, query: str, retries: int = 5) -> str:
+def validate_reply(reply: str, label: str, prompt_text: str) -> dict:
+    """Reject invalid annotations before they enter the successful cache."""
+    if not isinstance(reply, str):
+        raise ValueError("Expected reply text")
+    if label == "medical":
+        if not reply.strip():
+            raise ValueError("Empty medical label")
+        return {}
+    data = parse_json_reply(reply)
+    if not isinstance(data, dict) or not data or "_parse_error" in data:
+        raise ValueError("Expected a JSON object")
+    if label == "cognitive":
+        required = {"fit_status", "task_id", "cognitive_task", "inference_depth", "rationale", "memo"}
+        if not required <= data.keys():
+            raise ValueError("Missing cognitive fields")
+        status = data["fit_status"]
+        if status not in FIT_STATUSES:
+            raise ValueError("Invalid fit status")
+        catalog = {int(i): name.strip() for i, name in
+                   re.findall(r"^## (\d+)\. (.+)$", prompt_text, re.M)}
+        if status == "matched":
+            task_id = data["task_id"]
+            if type(task_id) is not int or task_id not in catalog:
+                raise ValueError("Invalid task ID")
+            if data["cognitive_task"] != catalog[task_id]:
+                raise ValueError("Task ID/name mismatch")
+        elif data["task_id"] is not None or data["cognitive_task"] is not None:
+            raise ValueError("Unmatched requests cannot receive a task")
+        if status in ("matched", "no_adequate_fit"):
+            if data["inference_depth"] not in ("surface", "one_step"):
+                raise ValueError("Invalid inference depth")
+        elif data["inference_depth"] is not None:
+            raise ValueError("Unknown/nonclinical cognition requires null depth")
+        if not isinstance(data["rationale"], str) or not data["rationale"].strip():
+            raise ValueError("Missing rationale")
+        if data["memo"] is not None and not isinstance(data["memo"], str):
+            raise ValueError("Invalid memo")
+    elif label == "inductive":
+        required = {"cognitive_intent", "secondary_intent", "clinical_task", "failure_mode",
+                    "non_cognitive", "insufficient_context"}
+        if not required <= data.keys():
+            raise ValueError("Missing inductive fields")
+        for field in ("non_cognitive", "insufficient_context"):
+            if type(data[field]) is not bool:
+                raise ValueError("Expected boolean flags")
+        if data["non_cognitive"] and data["insufficient_context"]:
+            raise ValueError("Conflicting inductive flags")
+        for field in ("cognitive_intent", "secondary_intent", "failure_mode"):
+            value = data[field]
+            if value is not None and (not isinstance(value, str) or not value.strip()
+                                      or value.strip().lower() == "null"):
+                raise ValueError("Expected text or JSON null")
+        if not isinstance(data["clinical_task"], str) or not data["clinical_task"].strip():
+            raise ValueError("Missing clinical task description")
+        excluded = data["non_cognitive"] or data["insufficient_context"]
+        if excluded and (data["cognitive_intent"] is not None or data["secondary_intent"] is not None):
+            raise ValueError("Excluded requests cannot receive intents")
+        if not excluded and data["cognitive_intent"] is None:
+            raise ValueError("Missing primary intent")
+    else:
+        raise ValueError("Unknown layer")
+    return data
+
+
+def cognitive_results(queries, cache, prompt_text):
+    """Build nullable task columns and explicit statuses, including technical failures."""
+    rows = []
+    for query in queries:
+        try:
+            data = validate_reply(cache.get(query, ""), "cognitive", prompt_text)
+        except ValueError:
+            data = {"fit_status": "invalid_response"}
+        status = data["fit_status"]
+        rows.append({
+            "cognitive_fit_status": status,
+            "cognitive_task_id": data.get("task_id"),
+            "cognitive_task": data.get("cognitive_task"),
+            "cognitive_catalog_match": status == "matched" if status in ("matched", "no_adequate_fit") else None,
+            "cognitive_outcome": data.get("cognitive_task") if status == "matched" else STATUS_LABELS[status],
+            "inference_depth": data.get("inference_depth"),
+            "cognitive_rationale": data.get("rationale"),
+            "cognitive_memo": data.get("memo"),
+        })
+    result = pd.DataFrame(rows)
+    result["cognitive_task_id"] = result["cognitive_task_id"].astype("Int64")
+    result["cognitive_catalog_match"] = result["cognitive_catalog_match"].astype("boolean")
+    return result
+
+
+def cognitive_summary(statuses):
+    counts = statuses.value_counts().to_dict()
+    assessable = counts.get("matched", 0) + counts.get("no_adequate_fit", 0)
+    return {
+        "cognitive_status_counts": {key: int(counts.get(key, 0)) for key in (*FIT_STATUSES, "invalid_response")},
+        "cognitive_assessable_clinical_queries": assessable,
+        "cognitive_taxonomy_coverage_pct": round(100 * counts.get("matched", 0) / assessable, 1) if assessable else None,
+        "cognitive_coverage_denominator": "matched + no_adequate_fit; excludes insufficient_context, nonclinical, invalid_response",
+        "cognitive_unlabeled": int(counts.get("invalid_response", 0)),
+    }
+
+
+def call_one(client, prompt_template: str, query: str, retries: int = 5, validator=None) -> str:
     prompt = prompt_template.replace("{USER_QUERY}", query)
     for attempt in range(retries):
         try:
@@ -284,12 +393,15 @@ def call_one(client, prompt_template: str, query: str, retries: int = 5) -> str:
                 temperature=TEMPERATURE,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return resp.choices[0].message.content.strip()
-        except Exception as exc:  # rate limits, transient network errors
+            reply = (resp.choices[0].message.content or "").strip()
+            if validator is not None:
+                validator(reply)
+            return reply
+        except Exception as exc:  # API errors and invalid annotations
             if attempt == retries - 1:
                 raise
             wait = 2**attempt
-            print(f"  retrying in {wait}s after: {exc}", file=sys.stderr)
+            print(f"  retrying in {wait}s after {type(exc).__name__}", file=sys.stderr)
             time.sleep(wait)
     return ""
 
@@ -325,7 +437,19 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue  # truncated last line from a hard kill
-                if rec.get("model") != MODEL or rec.get("prompt_sha") != fingerprint:
+                if not isinstance(rec, dict):
+                    stale += 1
+                    continue
+                if (rec.get("model") != MODEL or rec.get("prompt_sha") != fingerprint
+                        or rec.get("temperature") != TEMPERATURE
+                        or rec.get("validation_version") != VALIDATION_VERSION):
+                    stale += 1
+                    continue
+                try:
+                    if not isinstance(rec.get("query"), str):
+                        raise ValueError("Invalid cache query")
+                    validate_reply(rec.get("reply", ""), label, prompt_template)
+                except (ValueError, TypeError):
                     stale += 1
                     continue
                 cache[rec["query"]] = rec["reply"]
@@ -333,7 +457,7 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
         if stale:
             print(
                 f"[{label}] ignoring {stale} cached answers produced by a "
-                f"different model or prompt version; they will be relabeled."
+                f"different settings/schema or invalid replies; they will be relabeled."
             )
 
     todo = [q for q in unique_queries(queries) if q not in cache]
@@ -343,7 +467,9 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
     if todo:
         with cache_path.open("a") as fh, ThreadPoolExecutor(CONCURRENCY) as pool:
             futures = {
-                pool.submit(call_one, client, prompt_template, q): q for q in todo
+                pool.submit(call_one, client, prompt_template, q,
+                            validator=lambda r: validate_reply(r, label, prompt_template)): q
+                for q in todo
             }
             for n, fut in enumerate(as_completed(futures), start=1):
                 q = futures[fut]
@@ -352,7 +478,7 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
                 except Exception as exc:
                     # One unrecoverable query must not abandon the whole layer.
                     # Failures are not cached, so a rerun retries just these.
-                    failures.append((q, repr(exc)))
+                    failures.append((q, type(exc).__name__))
                     continue
                 cache[q] = reply
                 fh.write(
@@ -361,6 +487,8 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
                         "reply": reply,
                         "model": MODEL,
                         "prompt_sha": fingerprint,
+                        "temperature": TEMPERATURE,
+                        "validation_version": VALIDATION_VERSION,
                     })
                     + "\n"
                 )
@@ -371,12 +499,12 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
     if failures:
         print(
             f"WARNING: [{label}] {len(failures)} of {len(todo)} queries could "
-            f"not be labeled after retries. Those rows will be blank, and are "
+            f"not be labeled after retries. Those rows retain missing labels and are "
             f"counted in run_summary.json. Rerun to retry only these.",
             file=sys.stderr,
         )
         for q, err in failures[:5]:
-            print(f"  - {err}: {q[:80]}", file=sys.stderr)
+            print(f"  - {err}: no valid annotation saved", file=sys.stderr)
 
     return cache
 
@@ -412,10 +540,14 @@ def embed(labels: list[str]) -> np.ndarray:
 
 def cluster(vectors: np.ndarray, labels: list[str], k: int, merge_threshold: float):
     """Group similar labels, name each group, merge near-duplicate groups."""
+    if not labels:
+        return [], 0
+    if len(set(labels)) == 1:
+        return labels.copy(), 1
     from sklearn.cluster import KMeans
 
     n_unique = len(set(labels))
-    k_used = min(k, max(2, n_unique))
+    k_used = min(k, n_unique, len(labels))
     if k_used != k:
         print(
             f"NOTE: asked for {k} clusters but only {n_unique} distinct labels "
@@ -493,16 +625,16 @@ def main():
     ap.add_argument("--text-column", default="query")
     ap.add_argument(
         "--layers",
-        default="medical,cognitive",
+        default="medical,cognitive,inductive",
         help="Comma-separated: medical, cognitive, inductive. "
-        "Default runs medical and cognitive.",
+        "Default runs all three passes.",
     )
     ap.add_argument("--k", type=int, default=DEFAULT_K)
     ap.add_argument("--merge-threshold", type=float, default=DEFAULT_MERGE_THRESHOLD)
     ap.add_argument(
         "--skip-clustering",
         action="store_true",
-        help="Stop after labeling. Useful for a first look.",
+        help="Skip embeddings/clustering; write raw-label distributions and annotations.",
     )
     args = ap.parse_args()
 
@@ -510,6 +642,11 @@ def main():
     unknown = layers - {"medical", "cognitive", "inductive"}
     if unknown:
         sys.exit(f"Unknown layer(s): {sorted(unknown)}")
+
+    if not layers:
+        sys.exit("Select at least one layer")
+    if args.k < 1 or not 0 <= args.merge_threshold <= 2:
+        sys.exit("--k must be positive; --merge-threshold must be between 0 and 2")
 
     args.outdir.mkdir(parents=True, exist_ok=True)
 
@@ -540,44 +677,10 @@ def main():
             queries, PROMPT_COGNITIVE,
             args.outdir / "cache_cognitive.jsonl", "cognitive",
         )
-        parsed = {q: parse_json_reply(r) for q, r in cache.items()}
-        # Keep this numeric: the model returns "3" as a string, which makes
-        # every `df.cognitive_task_id == 3` filter silently False.
-        df["cognitive_task_id"] = pd.to_numeric(
-            df["query"].map(lambda q: parsed.get(q, {}).get("task_id")),
-            errors="coerce",
-        ).astype("Int64")
-        df["cognitive_task"] = df["query"].map(
-            lambda q: parsed.get(q, {}).get("cognitive_task")
-        )
-        df["cognitive_catalog_match"] = df["query"].map(
-            lambda q: parsed.get(q, {}).get("catalog_match")
-        )
-        df["inference_depth"] = df["query"].map(
-            lambda q: parsed.get(q, {}).get("inference_depth")
-        )
-        df["cognitive_rationale"] = df["query"].map(
-            lambda q: parsed.get(q, {}).get("rationale")
-        )
-        df["cognitive_memo"] = df["query"].map(
-            lambda q: parsed.get(q, {}).get("memo")
-        )
-
-        n_bad = sum(1 for v in parsed.values() if "_parse_error" in v)
-        if n_bad:
-            print(f"WARNING: {n_bad} cognitive answers were not valid JSON.")
-
-        memo = df["cognitive_memo"].fillna("").astype(str).str.strip().str.lower()
-        df["cognitive_forced_fit"] = memo.str.startswith("forced fit:")
-
-        matched = df["cognitive_catalog_match"].fillna(False).mean()
-        print(
-            f"\nCognitive coverage: {matched:.1%} of queries had a driver that "
-            f"is genuinely one of the 12.\n"
-            f"Forced fits: {df['cognitive_forced_fit'].mean():.1%} were assigned "
-            f"a task the prompt marked as the closest available rather than a "
-            f"true match.\n"
-        )
+        cognitive = cognitive_results(queries, cache, PROMPT_COGNITIVE.read_text())
+        df = pd.concat([df, cognitive], axis=1)
+        print("Cognitive fit statuses:")
+        print(df["cognitive_fit_status"].value_counts().to_string())
 
     # ---- Step 2: cognitive layer (inductive, blind to the task list)
     if "inductive" in layers:
@@ -602,8 +705,17 @@ def main():
             lambda q: parsed.get(q, {}).get("non_cognitive")
         )
 
+        df["inductive_insufficient_context"] = df["query"].map(
+            lambda q: parsed.get(q, {}).get("insufficient_context")
+        )
+        df["inductive_status"] = df["query"].map(
+            lambda q: "invalid_response" if q not in parsed else
+            "nonclinical" if parsed[q]["non_cognitive"] else
+            "insufficient_context" if parsed[q]["insufficient_context"] else "identified"
+        )
+
     # ---- Run settings. Written whether or not clustering runs, so a run is
-    # always reproducible and two runs can be compared field by field.
+    # traceable to its recorded settings.
     prompt_files = {
         "medical": PROMPT_MEDICAL,
         "cognitive": PROMPT_COGNITIVE,
@@ -633,37 +745,39 @@ def main():
             100 * df["medical_catalog_match"].mean(), 1
         )
     if "cognitive" in layers:
-        summary["cognitive_natural_fit_pct"] = round(
-            100 * df["cognitive_catalog_match"].fillna(False).mean(), 1
-        )
-        summary["cognitive_forced_fit_pct"] = round(
-            100 * df["cognitive_forced_fit"].mean(), 1
-        )
-        summary["cognitive_unlabeled"] = int(df["cognitive_task"].isna().sum())
-
-    if args.skip_clustering:
-        df.to_csv(args.outdir / "queries_labeled.csv", index=False)
-        (args.outdir / "run_summary.json").write_text(json.dumps(summary, indent=2))
-        print(f"Wrote {args.outdir / 'queries_labeled.csv'} and run_summary.json")
-        return
-
-    # ---- Step 3: grouping
-    if "medical" in layers:
-        vecs = embed(df["medical_task_raw"].tolist())
-        df["medical_task_group"], k_used = cluster(
-            vecs, df["medical_task_raw"].tolist(), args.k, args.merge_threshold
-        )
-        summary["medical_k_used"] = k_used
-        summary["medical_groups_after_merge"] = int(df["medical_task_group"].nunique())
-
+        summary.update(cognitive_summary(df["cognitive_fit_status"]))
     if "inductive" in layers:
-        intents = df["cognitive_intent"].fillna("(none)").astype(str).tolist()
-        vecs = embed(intents)
-        df["inductive_group"], k_used = cluster(
-            vecs, intents, args.k, args.merge_threshold
-        )
-        summary["inductive_k_used"] = k_used
-        summary["inductive_groups_after_merge"] = int(df["inductive_group"].nunique())
+        summary["inductive_status_counts"] = {
+            status: int((df["inductive_status"] == status).sum())
+            for status in ("identified", "nonclinical", "insufficient_context", "invalid_response")
+        }
+    summary["skip_clustering"] = args.skip_clustering
+    summary["validation_version"] = VALIDATION_VERSION
+
+    # Preserve completed annotations even if optional grouping later fails.
+    df.to_csv(args.outdir / "queries_labeled.csv", index=False)
+    (args.outdir / "run_summary.json").write_text(json.dumps(summary, indent=2))
+
+    def group_valid(source, target, valid, prefix):
+        df[target] = df[source].where(valid)
+        if not args.skip_clustering and valid.any():
+            labels = df.loc[valid, source].tolist()
+            if len(set(labels)) == 1:
+                groups, used = labels, 1
+            else:
+                groups, used = cluster(embed(labels), labels, args.k, args.merge_threshold)
+            df.loc[valid, target] = groups
+            summary[f"{prefix}_k_used"] = used
+            summary[f"{prefix}_groups_after_merge"] = len(set(groups))
+
+    if "medical" in layers:
+        valid = df["medical_task_raw"].notna() & df["medical_task_raw"].ne("")
+        group_valid("medical_task_raw", "medical_task_group", valid, "medical")
+        summary["medical_unlabeled"] = int((~valid).sum())
+    if "inductive" in layers:
+        valid = df["inductive_status"].eq("identified")
+        group_valid("cognitive_intent", "inductive_group", valid, "inductive")
+        df.loc[~valid, "inductive_group"] = df.loc[~valid, "inductive_status"].map(STATUS_LABELS)
 
     # ---- Step 4: write everything out
     df.to_csv(args.outdir / "queries_labeled.csv", index=False)
@@ -678,7 +792,8 @@ def main():
     if "medical" in layers:
         med = distribution("medical_task_group", "distribution_medical.csv")
     if "cognitive" in layers:
-        cog = distribution("cognitive_task", "distribution_cognitive.csv")
+        cog = distribution("cognitive_outcome", "distribution_cognitive.csv")
+        distribution("cognitive_fit_status", "distribution_cognitive_fit.csv")
     if "inductive" in layers:
         distribution("inductive_group", "distribution_inductive.csv")
 
@@ -686,16 +801,16 @@ def main():
     if "medical" in layers and "cognitive" in layers:
         ct = pd.crosstab(
             df["medical_task_group"].fillna(UNLABELED),
-            df["cognitive_task"].fillna(UNLABELED),
+            df["cognitive_outcome"].fillna(UNLABELED),
         )
         ct.to_csv(args.outdir / "crosstab_medical_x_cognitive.csv")
         written.append("crosstab_medical_x_cognitive.csv")
 
-    # Does the blind pass rediscover the defined tasks?
+    # Exploratory comparison; theme-to-taxonomy mapping requires human review.
     if "inductive" in layers and "cognitive" in layers:
         ct = pd.crosstab(
             df["inductive_group"].fillna(UNLABELED),
-            df["cognitive_task"].fillna(UNLABELED),
+            df["cognitive_outcome"].fillna(UNLABELED),
         )
         ct.to_csv(args.outdir / "crosstab_inductive_x_cognitive.csv")
         written.append("crosstab_inductive_x_cognitive.csv")
@@ -717,3 +832,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
