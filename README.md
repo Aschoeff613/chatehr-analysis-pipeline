@@ -1,188 +1,158 @@
 # ChatEHR query classification pipeline
 
-ChatEHR queries go in. Each one comes out with two labels: what medical work was
-asked for, and what thinking the request was serving.
+Classify provider requests along two axes: medical work requested and cognitive
+purpose inferred from the text. The cognitive axis uses independent deductive and
+inductive calls. These annotations describe requests, not directly observed
+clinician reasoning, model execution, or response quality.
 
-**Medical layer (the what).** Copies Appendix C.1 of Shah et al., *Adoption and Use
-of LLMs at an Academic Medical Center* (arXiv:2602.00074). The prompt is word for
-word from the paper.
-
-**Cognitive layer (the why).** The PACT cognitive classifier, run two ways. A
-deductive pass that maps each query to one of the defined tasks, and an optional
-inductive pass that asks the model to name what it sees without ever showing it the
-task list, so you can check whether the defined tasks turn up on their own.
-
-The two cognitive passes are separate calls. The inductive one never sees the task
-list. That is the whole point of running it, and it is why they cannot be combined
-into one call to save money.
-
----
-
-## Setup
+## Setup and running
 
 ```bash
 pip install -r requirements.txt
 export OPENAI_API_KEY="your-key"
-export CHATEHR_MODEL="gpt-4.1"    # or whichever model you are using
-```
-
----
-
-## Running it
-
-Check it works on the sample file first:
-
-```bash
-python pipeline.py sample_input.csv --input-format conversation \
-    --text-column conversation --outdir output_test
-```
-
-Your real data, one query per row:
-
-```bash
+export CHATEHR_MODEL="gpt-4.1"
 python pipeline.py your_file.csv --text-column query --outdir output
 ```
 
-Pick which layers to run:
+The default runs **medical, cognitive (deductive), and inductive** passes. Induction
+runs on every request, including deductive matches, and never receives deductive
+labels or task definitions. This adds an API call per unique request compared with
+the earlier two-pass default.
 
 ```bash
-# both cognitive passes as well
-python pipeline.py your_file.csv --layers medical,cognitive,inductive
+# Inspect annotations without embedding or clustering; distributions still written
+python pipeline.py your_file.csv --skip-clustering --outdir output_pilot
 
-# medical only
-python pipeline.py your_file.csv --layers medical
-```
+# Select specific passes
+python pipeline.py your_file.csv --layers medical,cognitive
 
-Look at the labels before committing to the grouping step:
+# Legacy transcript export
+python pipeline.py sample_input.csv --input-format conversation \
+    --text-column conversation --outdir output_test
 
-```bash
-python pipeline.py your_file.csv --skip-clustering
-```
-
-Run the tests after any change to the splitter, the parsing, or the task list:
-
-```bash
 python -m pytest tests/ -q
 ```
 
----
+Input is CSV or JSON with one request per row. Extra columns are carried through:
+include source platform/model, session ID, department, role, and date when available.
+Conversation mode extracts user turns using speaker-label heuristics. It does not
+retain preceding context for classification; ambiguous follow-ups may therefore
+receive insufficient_context. Audit transcript extraction before a study, since
+clinical headings can resemble speaker labels. Prefer structured exports with one
+request per row. Repeated identical request text reuses the same annotation.
 
-## Your input file
+## Deductive classification: assess the existing taxonomy
 
-A CSV with one query per row. Point `--text-column` at the column holding the
-query. Any other columns you include are carried through, so ask the data team for
-session ID, turn number, department, role and date, and you can break every
-distribution down by them afterwards.
+The prompt defines the final 12 Delphi-selected tasks, numbered 1–12. A request
+receives a task only when the definition adequately fits its primary cognitive
+need. There is no closest-task assignment and no predefined list of excluded
+cognitive drivers.
 
-If you get conversation transcripts instead, add `--input-format conversation` and
-the script pulls out the provider's turns. It recognizes `User:`, `Provider:`,
-`Clinician:`, `Physician:`, `Doctor:` and `Human:` for the provider, and
-`Assistant:`, `ChatEHR:`, `AI:`, `Model:` and `Response:` for the model, with `-`
-accepted in place of `:`. Bare `Q:`/`A:` transcripts work too, but only when the
-whole cell is written that way -- a stray `A:` line inside an answer will not split
-a turn. Any row with no recognizable speaker label is kept whole as a single query
-and counted in a warning, so you will see it rather than losing turns quietly.
+| cognitive_fit_status | Meaning | Task ID/name |
+|---|---|---|
+| matched | The expressed primary need fits a task | Defined ID and name |
+| no_adequate_fit | An identifiable clinical cognitive need does not fit any task | Empty |
+| insufficient_context | The cognitive need or primary task cannot be determined | Empty |
+| nonclinical | Clearly only nonclinical/administrative work | Empty |
+| invalid_response | No valid classification after retries | Empty |
 
----
+A rationale explains the assignment, mismatch, or missing evidence. Memo is an
+optional review note; it never determines fit status. A bare clinical note request
+is insufficient_context; explicit selection of relevant information can support
+task 3. Pure formatting is nonclinical. Uncertainty is not counted as a taxonomy gap.
 
-## What you get
+The row-level cognitive_catalog_match column is true for matched, false for
+no_adequate_fit, and empty for other statuses. The task name remains empty for
+unassigned rows; cognitive_outcome provides readable status labels for tables.
 
-| File | What it is |
+**Taxonomy coverage** is matched / (matched + no_adequate_fit). The summary records
+this denominator and all five status counts. Coverage is null when no requests are
+assessable. Report missing-context, nonclinical, and technical-failure counts too;
+coverage remains a classifier estimate pending human validation.
+
+## Inductive classification: describe the observed operations
+
+The separate prompt describes cognitive_intent without the task list. It also
+records secondary_intent, clinical_task, failure_mode, non_cognitive, and
+insufficient_context. Nonclinical requests, missing context, and technical failures
+remain separate in the output and are excluded from embedding/clustering.
+
+Only primary cognitive_intent enters clustering. Secondary intent is retained for
+qualitative review, not counted in the primary-task distribution. Neither pass
+estimates the prevalence of all operations within compound requests.
+
+Inductive themes do **not automatically identify taxonomy gaps**. Reviewers should
+examine themes without deductive labels, then map them to the frozen taxonomy.
+A theme may be a synonym, a narrower instance of a task, or a genuinely uncovered
+need. The inductive-by-deductive cross-tab is exploratory comparison, not independent
+validation. Both calls use the same classifier model and may share biases.
+
+## Outputs
+
+| File | Contents |
 |---|---|
-| `queries_labeled.csv` | Every query with all its labels. This is what you sample from for the clinician review. |
-| `distribution_medical.csv` | Medical task breakdown. |
-| `distribution_cognitive.csv` | Cognitive task breakdown. |
-| `distribution_inductive.csv` | The tasks the blind pass came up with on its own. |
-| `crosstab_medical_x_cognitive.csv` | Medical work against cognitive work. This is the two-layer result. |
-| `crosstab_inductive_x_cognitive.csv` | Whether the blind pass rediscovered the defined tasks. |
-| `run_summary.json` | Every setting used, including the prompt hash, the git commit, and the natural-fit and forced-fit rates. Copy into your Methods. |
-| `cache_*.jsonl` | Saved as it goes. If a run dies, restart and it picks up rather than paying twice. |
+| queries_labeled.csv | Requests, original metadata, annotations, explicit statuses |
+| distribution_medical.csv | Medical label/group counts |
+| distribution_cognitive.csv | Matched task counts plus separate unassigned/error outcomes |
+| distribution_cognitive_fit.csv | All five deductive statuses, with percentages of all requests |
+| distribution_inductive.csv | Primary intent/group counts plus separate nonclinical/context/error outcomes |
+| crosstab_medical_x_cognitive.csv | Medical work versus deductive outcomes |
+| crosstab_inductive_x_cognitive.csv | Exploratory theme/intent versus deductive outcomes |
+| run_summary.json | Settings, prompt hashes, counts, coverage denominator, grouping details |
+| cache_*.jsonl | Validated successful replies, keyed by request and run settings |
 
----
+Only files for selected layers are written. With --skip-clustering, group columns
+contain raw labels/intents and all selected distributions and cross-tabs are still
+written. Use a new output directory for each analysis configuration to avoid stale
+files from prior layer selections. Row-level annotations and an initial summary
+are saved before optional clustering so completed work survives grouping failures.
 
-## The cognitive task list
+## Validation, caching, and reproducibility
 
-`prompt_cognitive_deductive.txt` holds the final 12 Delphi-selected tasks, numbered
-1-12 by composite rank. Diagnostic reasoning is task 1; Rapid acuity appraisal is
-task 12. The earlier 17-task version is in git history if you need it for the
-Methods.
+Cognitive replies must have all required fields, valid statuses, integer task IDs,
+matching canonical names, and consistent null/task fields. Inductive replies must
+have boolean flags and consistent intent fields. Invalid replies are retried up to
+five attempts and are not cached as successes. Technical failures retain rows and
+are counted separately. Medical labels are checked for nonempty text, not semantic
+correctness. Validate medical label quality separately.
 
-Every clinical query is assigned one of the 12. The five constructs the Delphi
-dropped -- managing uncertainty, judging credibility and completeness, team and
-distributed cognition, metacognitive self-regulation, and encounter scoping -- no
-longer exist as labels. A query driven by one of them is assigned the closest of the
-12, `catalog_match` is set to false, and the memo begins `forced fit: <driver>`. The
-routing table is in the prompt under "Forced fits".
+Cache reuse requires matching model, prompt hash, temperature, and validation
+version, plus a valid response under the current schema. Old caches are skipped;
+the first run after this migration may relabel previously cached requests. Error
+logs omit request snippets. Temperature zero reduces variability but does not
+guarantee deterministic classifications.
 
-That gives you two numbers rather than one. `cognitive_natural_fit_pct` in
-`run_summary.json` is the share whose driver is genuinely one of the 12;
-`cognitive_forced_fit_pct` is the share the 12 do not natively cover. The forced-fit
-rate is the finding, not a defect -- it is how much of real ChatEHR use sits outside
-the final taxonomy. `queries_labeled.csv` carries a `cognitive_forced_fit` column so
-you can pull those rows for the clinician review.
+The medical prompt follows Appendix C.1 of Shah et al., *Adoption and Use of LLMs
+at an Academic Medical Center* ([paper](https://arxiv.org/abs/2602.00074)). Its
+inherited dry-mouth/drug-interaction example remains a known limitation in this
+change. The medical layer uses all-mpnet-base-v2 embeddings and K-means with a
+maximum of 1,000 initial clusters. One distinct label needs no embedding or K-means.
+Missing labels are excluded from clustering. The 0.15 cosine-distance merge
+threshold is an assumption, not a parameter reported by the paper. Merges are
+transitive and can combine distinct labels; review cluster membership and assess
+sensitivity before interpreting grouped distributions.
 
-Document generation routes to task 3: what the request drives is deciding what
-belongs in the record, and the medical layer already records which document was
-asked for. When the provider specifies what to include and why, that selection is a
-genuine task 3. When the request is bare ("generate the ED note"), it is task 3 as a
-forced fit. Naming a recipient does not change the task. The 17-task version routed
-documentation to team and distributed cognition on the argument that a note
-transmits clinical state across providers and time; that does not hold against the
-construct as defined, which requires trust, delegation or responsibility to be at
-issue.
+## Migration from forced fits
 
-Billing lookups, software troubleshooting and work queue mechanics are the only
-queries with no task at all. They get `task_id` 0 and
-`"System operation, not clinical cognition"`.
+The cognitive_forced_fit column and cognitive_natural_fit_pct /
+cognitive_forced_fit_pct summary fields are removed. Use cognitive_fit_status and
+cognitive_taxonomy_coverage_pct instead. Nonclinical requests no longer use task ID
+0; every unassigned task has a null ID and name. Existing scripts expecting complete
+task columns or the old coverage denominator must be updated. Inductive responses
+now include insufficient_context. Prompt changes invalidate prior annotations.
 
-If you edit the task list again, three things have to move together: the task
-definitions, every `task N` cross-reference in the guardrails and boundary lines,
-and the `1-12` range in the output format at the bottom. Nothing in `pipeline.py`
-needs to change -- it reads whatever is in the prompt file, and `run_summary.json`
-records the prompt hash so a run is always traceable to the wording it used.
-`tests/test_pipeline.py` fails if a cross-reference points at a task that no longer
-exists.
+## Before interpreting a study
 
-## Things to be aware of
+- Obtain taxonomy-owner approval of the definitions and classification rules.
+- Develop guidelines on a diverse sample; freeze prompts and test on a separate
+  sample with two independent clinician reviewers and adjudication.
+- Validate task identity and fit status, including rare tasks and ambiguous cases.
+- Keep sessions together across development/validation splits; distinguish
+  request-level from encounter-level prevalence and evaluate each source platform.
+- Review inductive themes before exposing deductive labels, then map the themes.
 
-**The cluster merge threshold is a guess.** The paper says they merged clusters that
-sat close together but never says how close. The default here is 0.15. Ask Miguel
-Fuentes for the real value. It changes how many final tasks you end up with, so
-whatever you use has to go in your Methods.
-
-**The number of groups scales down automatically.** The paper used 1000 across
-roughly 23,000 sessions. On a smaller set that would put nearly every query in its
-own group, so the script reduces it and says so. Report the number it prints, not
-1000.
-
-**You still need the clinician check.** The paper validated by taking 100 random
-queries and having two clinicians say whether the assigned label was appropriate.
-They got 73.5% using gpt-4.1. If you use a different model you cannot lean on that
-number. Run the same check on both layers, with different reviewers for each, as
-they did. `queries_labeled.csv` is what you sample from.
-
-**Watch the 3 vs 7 confusion.** The cognitive prompt says so itself: gathering
-information and interpreting it absorb most of the corpus and most of the
-misclassification. In the 12-task numbering those are task 3 and task 7. Task 3 also
-now receives four separate forced-fit drivers, so check it specifically during the
-clinician review -- filter on `cognitive_forced_fit` and read the memos.
-
-**Reruns no longer reuse labels across a prompt change.** Each line in
-`cache_*.jsonl` records the model and the prompt hash that produced it. Cached
-answers from a different model or an edited prompt are ignored and relabeled, and
-the script says how many it skipped. You can safely rerun into an existing output
-directory.
-
-**A query that cannot be labeled no longer stops the run.** After five failed
-attempts that query is skipped, the run finishes, and the count appears in
-`run_summary.json` as `cognitive_unlabeled`. Failures are not cached, so rerunning
-retries only those. Unlabeled rows are reported as
-`(unlabeled: no valid reply)` in the distributions rather than dropped, so the
-percentages still sum to 100.
-
-## What this does not include
-
-The paper's second classifier, which sorts queries by phrasing (summarization,
-question answering, extraction, and so on). Your design uses the medical layer plus
-the cognitive layer instead. The published version of that prompt also contains a
-mislabeled example, which is a second reason to leave it out.
+Raw request text is sent to the configured API and retained in plaintext caches and
+CSV outputs. Instructions to omit PHI from generated labels do not de-identify the
+inputs. Use the institutionally approved endpoint and storage workflow for actual
+encounters. The paper's medical-label agreement does not validate this cognitive
+classifier or a new population.
