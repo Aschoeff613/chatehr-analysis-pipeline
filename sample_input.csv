@@ -1,0 +1,13 @@
+session_id,department,conversation
+1,Emergency,"User: Summarize this patient's cardiac history before I see her
+Assistant: The patient has a history of...
+User: Any prior stress tests documented?
+Assistant: Yes, a stress echo in..."
+2,Primary Care,"User: Does she meet criteria for the current colonoscopy screening interval?
+Assistant: Based on age and risk..."
+3,Emergency,"User: Generate the ED note for handoff to the overnight team
+Assistant: Here is a draft note..."
+4,Primary Care,"User: Do any of his current meds interact with the new metoprolol?
+Assistant: Reviewing the medication list..."
+5,Emergency,"User: Give me a differential for this presentation
+Assistant: Considering the history..."

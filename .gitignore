@@ -1,0 +1,36 @@
+# Secrets
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+
+# Pipeline outputs — labeled queries may contain PHI, never commit
+output/
+output_*/
+cache_*.jsonl
+*_labeled.csv
+distribution_*.csv
+crosstab_*.csv
+run_summary.json
+
+# Real input data — only sample_input.csv is tracked
+*.csv
+!sample_input.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Models / caches
+.cache/
+sentence_transformers_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
