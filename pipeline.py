@@ -18,11 +18,14 @@ Run `python pipeline.py --help` for options, or read README.md.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -61,6 +64,10 @@ DEFAULT_MERGE_THRESHOLD = 0.15
 # How many labeling calls to run at once.
 CONCURRENCY = 8
 
+# Rows whose reply could not be parsed are reported under this label rather
+# than dropped, so every distribution sums to the number of queries.
+UNLABELED = "(unlabeled: no valid reply)"
+
 HERE = Path(__file__).parent
 PROMPT_MEDICAL = HERE / "prompt_c1_medical_task_normalization.txt"
 PROMPT_COGNITIVE = HERE / "prompt_cognitive_deductive.txt"
@@ -71,13 +78,21 @@ PROMPT_INDUCTIVE = HERE / "prompt_cognitive_inductive.txt"
 # Step 1: get one query per row
 # --------------------------------------------------------------------------
 
-USER_MARKERS = r"(?:user|provider|clinician|physician|doctor|human|q)"
-ASSISTANT_MARKERS = r"(?:assistant|chatehr|ai|model|response|a)"
+# Single letters are deliberately NOT markers here. A line starting "Q:" or
+# "A:" inside a clinical answer ("Q: waves present in III") would otherwise be
+# read as a speaker change, which both truncates the real provider turn and
+# invents a provider query out of the model's own text.
+USER_MARKERS = r"(?:user|provider|clinician|physician|doctor|human)"
+ASSISTANT_MARKERS = r"(?:assistant|chatehr|ai|model|response)"
 TURN_RE = re.compile(
     rf"^\s*({USER_MARKERS}|{ASSISTANT_MARKERS})\s*[:\-]\s*",
     re.IGNORECASE | re.MULTILINE,
 )
 IS_USER_RE = re.compile(rf"^{USER_MARKERS}$", re.IGNORECASE)
+
+# Bare Q/A transcripts are still supported, but only when the whole cell is
+# written that way: no named speakers anywhere, and at least two Q/A lines.
+QA_TURN_RE = re.compile(r"^\s*(q|a)\s*[:\-]\s*", re.IGNORECASE | re.MULTILINE)
 
 
 def split_conversation(text: str) -> list[str]:
@@ -89,19 +104,72 @@ def split_conversation(text: str) -> list[str]:
     if not isinstance(text, str) or not text.strip():
         return []
 
+    def named_speaker_is_user(speaker: str) -> bool:
+        return bool(IS_USER_RE.match(speaker))
+
+    def qa_speaker_is_user(speaker: str) -> bool:
+        return speaker.lower() == "q"
+
     matches = list(TURN_RE.finditer(text))
+    is_user = named_speaker_is_user
+
     if not matches:
-        return [text.strip()]
+        qa = list(QA_TURN_RE.finditer(text))
+        if len(qa) >= 2:
+            matches, is_user = qa, qa_speaker_is_user
+        else:
+            # No speaker markers at all. Treat the whole cell as one query;
+            # load_queries counts these and warns.
+            return [text.strip()]
 
     turns = []
     for i, m in enumerate(matches):
-        speaker = m.group(1)
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         body = text[start:end].strip()
-        if body and IS_USER_RE.match(speaker):
+        if body and is_user(m.group(1)):
             turns.append(body)
     return turns
+
+
+def unique_queries(queries: list[str]) -> list[str]:
+    """Distinct queries, first-seen order. Identical queries cost one call."""
+    return list(dict.fromkeys(queries))
+
+
+def distribution_table(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Counts and percentages for one label column, most common first.
+
+    Rows whose reply could not be parsed are reported as UNLABELED rather than
+    dropped: groupby discards null keys, which used to delete them while the
+    percentage was still divided by the full row count, so the numbers
+    under-reported and did not sum to 100.
+    """
+    return (
+        df[col].fillna(UNLABELED)
+        .value_counts(dropna=False)
+        .rename("n_queries")
+        .rename_axis(col)
+        .reset_index()
+        .assign(pct_of_queries=lambda x: 100 * x["n_queries"] / len(df))
+    )
+
+
+def prompt_fingerprint(path: Path) -> str:
+    """Short hash of a prompt file, so a run can be tied to the exact wording."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+
+def git_commit() -> str | None:
+    """Short commit of this checkout, or None outside a repo."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
 
 
 def load_queries(path: Path, input_format: str, text_column: str) -> pd.DataFrame:
@@ -118,19 +186,43 @@ def load_queries(path: Path, input_format: str, text_column: str) -> pd.DataFram
     # distribution down by them later.
     passthrough = [c for c in df.columns if c != text_column]
 
+    reserved = {"source_row", "turn", "query"} & set(passthrough)
+    if reserved:
+        print(
+            f"NOTE: input column(s) {sorted(reserved)} clash with names this "
+            f"script adds; yours are kept as orig_<name>."
+        )
+
     rows = []
+    unsplit = 0
     for idx, row in df.iterrows():
         if input_format == "queries":
             queries = [str(row[text_column]).strip()]
         else:
-            queries = split_conversation(row[text_column])
+            raw = row[text_column]
+            queries = split_conversation(raw)
+            if (
+                len(queries) == 1
+                and isinstance(raw, str)
+                and queries[0] == raw.strip()
+            ):
+                unsplit += 1
 
         for turn_no, q in enumerate(queries, start=1):
             if not q or q.lower() == "nan":
                 continue
-            record = {c: row[c] for c in passthrough}
+            record = {
+                (f"orig_{c}" if c in reserved else c): row[c] for c in passthrough
+            }
             record.update({"source_row": idx, "turn": turn_no, "query": q})
             rows.append(record)
+
+    if unsplit:
+        print(
+            f"WARNING: {unsplit} of {len(df)} rows had no recognizable speaker "
+            f"markers and were each treated as a single query. If your export "
+            f"uses a different speaker label, add it to USER_MARKERS."
+        )
 
     out = pd.DataFrame(rows)
     if out.empty:
@@ -216,18 +308,38 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
 
     client = OpenAI()
     prompt_template = prompt_path.read_text()
+    fingerprint = prompt_fingerprint(prompt_path)
 
+    # Cached answers record the model and prompt version that produced them.
+    # Anything labeled under a different model or an edited prompt is ignored
+    # rather than silently reused.
     cache: dict[str, str] = {}
+    stale = 0
     if cache_path.exists():
         with cache_path.open() as fh:
             for line in fh:
-                rec = json.loads(line)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # truncated last line from a hard kill
+                if rec.get("model") != MODEL or rec.get("prompt_sha") != fingerprint:
+                    stale += 1
+                    continue
                 cache[rec["query"]] = rec["reply"]
-        print(f"[{label}] loaded {len(cache)} answers from previous run.")
+        print(f"[{label}] reusing {len(cache)} answers from a previous run.")
+        if stale:
+            print(
+                f"[{label}] ignoring {stale} cached answers produced by a "
+                f"different model or prompt version; they will be relabeled."
+            )
 
-    todo = [q for q in dict.fromkeys(queries) if q not in cache]
+    todo = [q for q in unique_queries(queries) if q not in cache]
     print(f"[{label}] labeling {len(todo)} new queries with {MODEL}...")
 
+    failures: list[tuple[str, str]] = []
     if todo:
         with cache_path.open("a") as fh, ThreadPoolExecutor(CONCURRENCY) as pool:
             futures = {
@@ -235,12 +347,36 @@ def run_layer(queries: list[str], prompt_path: Path, cache_path: Path, label: st
             }
             for n, fut in enumerate(as_completed(futures), start=1):
                 q = futures[fut]
-                reply = fut.result()
+                try:
+                    reply = fut.result()
+                except Exception as exc:
+                    # One unrecoverable query must not abandon the whole layer.
+                    # Failures are not cached, so a rerun retries just these.
+                    failures.append((q, repr(exc)))
+                    continue
                 cache[q] = reply
-                fh.write(json.dumps({"query": q, "reply": reply}) + "\n")
+                fh.write(
+                    json.dumps({
+                        "query": q,
+                        "reply": reply,
+                        "model": MODEL,
+                        "prompt_sha": fingerprint,
+                    })
+                    + "\n"
+                )
                 fh.flush()
                 if n % 50 == 0 or n == len(todo):
                     print(f"  [{label}] {n}/{len(todo)}")
+
+    if failures:
+        print(
+            f"WARNING: [{label}] {len(failures)} of {len(todo)} queries could "
+            f"not be labeled after retries. Those rows will be blank, and are "
+            f"counted in run_summary.json. Rerun to retry only these.",
+            file=sys.stderr,
+        )
+        for q, err in failures[:5]:
+            print(f"  - {err}: {q[:80]}", file=sys.stderr)
 
     return cache
 
@@ -405,9 +541,12 @@ def main():
             args.outdir / "cache_cognitive.jsonl", "cognitive",
         )
         parsed = {q: parse_json_reply(r) for q, r in cache.items()}
-        df["cognitive_task_id"] = df["query"].map(
-            lambda q: parsed.get(q, {}).get("task_id")
-        )
+        # Keep this numeric: the model returns "3" as a string, which makes
+        # every `df.cognitive_task_id == 3` filter silently False.
+        df["cognitive_task_id"] = pd.to_numeric(
+            df["query"].map(lambda q: parsed.get(q, {}).get("task_id")),
+            errors="coerce",
+        ).astype("Int64")
         df["cognitive_task"] = df["query"].map(
             lambda q: parsed.get(q, {}).get("cognitive_task")
         )
@@ -428,10 +567,16 @@ def main():
         if n_bad:
             print(f"WARNING: {n_bad} cognitive answers were not valid JSON.")
 
+        memo = df["cognitive_memo"].fillna("").astype(str).str.strip().str.lower()
+        df["cognitive_forced_fit"] = memo.str.startswith("forced fit:")
+
         matched = df["cognitive_catalog_match"].fillna(False).mean()
         print(
-            f"\nCognitive coverage: {matched:.1%} of queries fit one of the "
-            f"defined cognitive tasks.\n"
+            f"\nCognitive coverage: {matched:.1%} of queries had a driver that "
+            f"is genuinely one of the 12.\n"
+            f"Forced fits: {df['cognitive_forced_fit'].mean():.1%} were assigned "
+            f"a task the prompt marked as the closest available rather than a "
+            f"true match.\n"
         )
 
     # ---- Step 2: cognitive layer (inductive, blind to the task list)
@@ -457,22 +602,52 @@ def main():
             lambda q: parsed.get(q, {}).get("non_cognitive")
         )
 
-    if args.skip_clustering:
-        df.to_csv(args.outdir / "queries_labeled.csv", index=False)
-        print(f"Wrote {args.outdir / 'queries_labeled.csv'}")
-        return
-
-    # ---- Step 3: grouping
+    # ---- Run settings. Written whether or not clustering runs, so a run is
+    # always reproducible and two runs can be compared field by field.
+    prompt_files = {
+        "medical": PROMPT_MEDICAL,
+        "cognitive": PROMPT_COGNITIVE,
+        "inductive": PROMPT_INDUCTIVE,
+    }
     summary = {
+        "run_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "git_commit": git_commit(),
         "model": MODEL,
         "temperature": TEMPERATURE,
         "embedding_model": EMBEDDING_MODEL,
         "k_requested": args.k,
         "merge_threshold": args.merge_threshold,
         "layers": sorted(layers),
+        "input_format": args.input_format,
         "n_queries": int(len(df)),
+        # The task list lives in the prompt file, so the prompt hash is the
+        # only thing that identifies which taxonomy a run used.
+        "prompt_versions": {
+            name: {"file": path.name, "sha256_12": prompt_fingerprint(path)}
+            for name, path in prompt_files.items()
+            if name in layers
+        },
     }
+    if "medical" in layers:
+        summary["medical_catalog_coverage_pct"] = round(
+            100 * df["medical_catalog_match"].mean(), 1
+        )
+    if "cognitive" in layers:
+        summary["cognitive_natural_fit_pct"] = round(
+            100 * df["cognitive_catalog_match"].fillna(False).mean(), 1
+        )
+        summary["cognitive_forced_fit_pct"] = round(
+            100 * df["cognitive_forced_fit"].mean(), 1
+        )
+        summary["cognitive_unlabeled"] = int(df["cognitive_task"].isna().sum())
 
+    if args.skip_clustering:
+        df.to_csv(args.outdir / "queries_labeled.csv", index=False)
+        (args.outdir / "run_summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"Wrote {args.outdir / 'queries_labeled.csv'} and run_summary.json")
+        return
+
+    # ---- Step 3: grouping
     if "medical" in layers:
         vecs = embed(df["medical_task_raw"].tolist())
         df["medical_task_group"], k_used = cluster(
@@ -480,9 +655,6 @@ def main():
         )
         summary["medical_k_used"] = k_used
         summary["medical_groups_after_merge"] = int(df["medical_task_group"].nunique())
-        summary["medical_catalog_coverage_pct"] = round(
-            100 * df["medical_catalog_match"].mean(), 1
-        )
 
     if "inductive" in layers:
         intents = df["cognitive_intent"].fillna("(none)").astype(str).tolist()
@@ -498,14 +670,7 @@ def main():
     written = ["queries_labeled.csv"]
 
     def distribution(col: str, fname: str):
-        d = (
-            df.groupby(col)
-            .size()
-            .rename("n_queries")
-            .reset_index()
-            .assign(pct_of_queries=lambda x: 100 * x["n_queries"] / len(df))
-            .sort_values("n_queries", ascending=False)
-        )
+        d = distribution_table(df, col)
         d.to_csv(args.outdir / fname, index=False)
         written.append(fname)
         return d
@@ -519,13 +684,19 @@ def main():
 
     # The payoff: what medical work, crossed with what cognitive work.
     if "medical" in layers and "cognitive" in layers:
-        ct = pd.crosstab(df["medical_task_group"], df["cognitive_task"])
+        ct = pd.crosstab(
+            df["medical_task_group"].fillna(UNLABELED),
+            df["cognitive_task"].fillna(UNLABELED),
+        )
         ct.to_csv(args.outdir / "crosstab_medical_x_cognitive.csv")
         written.append("crosstab_medical_x_cognitive.csv")
 
     # Does the blind pass rediscover the defined tasks?
     if "inductive" in layers and "cognitive" in layers:
-        ct = pd.crosstab(df["inductive_group"], df["cognitive_task"])
+        ct = pd.crosstab(
+            df["inductive_group"].fillna(UNLABELED),
+            df["cognitive_task"].fillna(UNLABELED),
+        )
         ct.to_csv(args.outdir / "crosstab_inductive_x_cognitive.csv")
         written.append("crosstab_inductive_x_cognitive.csv")
 

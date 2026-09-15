@@ -59,6 +59,12 @@ Look at the labels before committing to the grouping step:
 python pipeline.py your_file.csv --skip-clustering
 ```
 
+Run the tests after any change to the splitter, the parsing, or the task list:
+
+```bash
+python -m pytest tests/ -q
+```
+
 ---
 
 ## Your input file
@@ -69,7 +75,13 @@ session ID, turn number, department, role and date, and you can break every
 distribution down by them afterwards.
 
 If you get conversation transcripts instead, add `--input-format conversation` and
-the script pulls out the provider's turns.
+the script pulls out the provider's turns. It recognizes `User:`, `Provider:`,
+`Clinician:`, `Physician:`, `Doctor:` and `Human:` for the provider, and
+`Assistant:`, `ChatEHR:`, `AI:`, `Model:` and `Response:` for the model, with `-`
+accepted in place of `:`. Bare `Q:`/`A:` transcripts work too, but only when the
+whole cell is written that way -- a stray `A:` line inside an answer will not split
+a turn. Any row with no recognizable speaker label is kept whole as a single query
+and counted in a warning, so you will see it rather than losing turns quietly.
 
 ---
 
@@ -83,7 +95,7 @@ the script pulls out the provider's turns.
 | `distribution_inductive.csv` | The tasks the blind pass came up with on its own. |
 | `crosstab_medical_x_cognitive.csv` | Medical work against cognitive work. This is the two-layer result. |
 | `crosstab_inductive_x_cognitive.csv` | Whether the blind pass rediscovered the defined tasks. |
-| `run_summary.json` | Every setting used. Copy into your Methods. |
+| `run_summary.json` | Every setting used, including the prompt hash, the git commit, and the natural-fit and forced-fit rates. Copy into your Methods. |
 | `cache_*.jsonl` | Saved as it goes. If a run dies, restart and it picks up rather than paying twice. |
 
 ---
@@ -95,30 +107,41 @@ the script pulls out the provider's turns.
 task 12. The earlier 17-task version is in git history if you need it for the
 Methods.
 
-Five constructs were excluded: managing uncertainty, judging credibility and
-completeness, team and distributed cognition, metacognitive self-regulation, and
-encounter scoping. Queries driven by those are labeled `task_id` 0 with
-`cognitive_task` set to an exact `"Outside the 12: <construct>"` string, so each one
-counts as its own row in `distribution_cognitive.csv` rather than being absorbed
-into a surviving task. Billing lookups and software troubleshooting still get
+Every clinical query is assigned one of the 12. The five constructs the Delphi
+dropped -- managing uncertainty, judging credibility and completeness, team and
+distributed cognition, metacognitive self-regulation, and encounter scoping -- no
+longer exist as labels. A query driven by one of them is assigned the closest of the
+12, `catalog_match` is set to false, and the memo begins `forced fit: <driver>`. The
+routing table is in the prompt under "Forced fits".
+
+That gives you two numbers rather than one. `cognitive_natural_fit_pct` in
+`run_summary.json` is the share whose driver is genuinely one of the 12;
+`cognitive_forced_fit_pct` is the share the 12 do not natively cover. The forced-fit
+rate is the finding, not a defect -- it is how much of real ChatEHR use sits outside
+the final taxonomy. `queries_labeled.csv` carries a `cognitive_forced_fit` column so
+you can pull those rows for the clinician review.
+
+Document generation routes to task 3: what the request drives is deciding what
+belongs in the record, and the medical layer already records which document was
+asked for. When the provider specifies what to include and why, that selection is a
+genuine task 3. When the request is bare ("generate the ED note"), it is task 3 as a
+forced fit. Naming a recipient does not change the task. The 17-task version routed
+documentation to team and distributed cognition on the argument that a note
+transmits clinical state across providers and time; that does not hold against the
+construct as defined, which requires trust, delegation or responsibility to be at
+issue.
+
+Billing lookups, software troubleshooting and work queue mechanics are the only
+queries with no task at all. They get `task_id` 0 and
 `"System operation, not clinical cognition"`.
-
-Document generation is handled separately, and not as a cognitive task. The medical
-layer already records which document was asked for, so on the cognitive layer a bare
-"generate the ED note" is labeled `"Document production, not clinical cognition"`.
-The 17-task version routed documentation to team and distributed cognition on the
-argument that a note transmits clinical state across providers; that does not hold
-against the construct as defined, which requires trust, delegation or responsibility
-to be at issue. A document request that specifies what to include and why goes to
-task 3, since the provider did the selection.
-
-Expect the excluded and non-cognitive rows together to be a large share of the
-corpus.
 
 If you edit the task list again, three things have to move together: the task
 definitions, every `task N` cross-reference in the guardrails and boundary lines,
 and the `1-12` range in the output format at the bottom. Nothing in `pipeline.py`
-needs to change -- it reads whatever is in the prompt file.
+needs to change -- it reads whatever is in the prompt file, and `run_summary.json`
+records the prompt hash so a run is always traceable to the wording it used.
+`tests/test_pipeline.py` fails if a cross-reference points at a task that no longer
+exists.
 
 ## Things to be aware of
 
@@ -140,16 +163,22 @@ they did. `queries_labeled.csv` is what you sample from.
 
 **Watch the 3 vs 7 confusion.** The cognitive prompt says so itself: gathering
 information and interpreting it absorb most of the corpus and most of the
-misclassification. In the 12-task numbering those are task 3 and task 7. The third
-member of that old trio -- trusting the information -- is now outside the 12, so
-also check that credibility queries are landing at 0 rather than being quietly
-pulled into 3 or 7.
+misclassification. In the 12-task numbering those are task 3 and task 7. Task 3 also
+now receives four separate forced-fit drivers, so check it specifically during the
+clinician review -- filter on `cognitive_forced_fit` and read the memos.
 
-**Reruns reuse old labels, silently.** `cache_*.jsonl` is keyed on query text alone
-and records nothing about which prompt or model produced the answer. Rerunning into
-an output directory from before the 12-task switch will hand back the old 17-task
-labels and print "labeling 0 new queries" as though all is well. Use a fresh
-`--outdir` whenever the prompt or the model changes.
+**Reruns no longer reuse labels across a prompt change.** Each line in
+`cache_*.jsonl` records the model and the prompt hash that produced it. Cached
+answers from a different model or an edited prompt are ignored and relabeled, and
+the script says how many it skipped. You can safely rerun into an existing output
+directory.
+
+**A query that cannot be labeled no longer stops the run.** After five failed
+attempts that query is skipped, the run finishes, and the count appears in
+`run_summary.json` as `cognitive_unlabeled`. Failures are not cached, so rerunning
+retries only those. Unlabeled rows are reported as
+`(unlabeled: no valid reply)` in the distributions rather than dropped, so the
+percentages still sum to 100.
 
 ## What this does not include
 
