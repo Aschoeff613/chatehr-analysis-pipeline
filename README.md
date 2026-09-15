@@ -88,20 +88,29 @@ the script pulls out the provider's turns.
 
 ---
 
-## Updating the cognitive task list to the final 12
+## The cognitive task list
 
-The task definitions live in `prompt_cognitive_deductive.txt`, which currently holds
-17. When the final 12 are ready, edit that file. Three things have to change
-together, not just the list:
+`prompt_cognitive_deductive.txt` holds the final 12 Delphi-selected tasks, numbered
+1-12 by composite rank. Diagnostic reasoning is task 1; Rapid acuity appraisal is
+task 12. The earlier 17-task version is in git history if you need it for the
+Methods.
 
-1. Delete the five dropped tasks and renumber the rest.
-2. Fix every cross-reference. The guardrails and the boundary lines point at tasks
-   by number ("this is task 3, not task 7") throughout. Those numbers all move.
-3. Update the output format at the bottom, which says 1-17.
+Five constructs were excluded: managing uncertainty, judging credibility and
+completeness, team and distributed cognition, metacognitive self-regulation, and
+encounter scoping. Queries driven by those are labeled `task_id` 0 with
+`cognitive_task` set to an exact `"Outside the 12: <construct>"` string, so each one
+counts as its own row in `distribution_cognitive.csv` rather than being absorbed
+into a surviving task. Billing lookups and software troubleshooting still get
+`"System operation, not clinical cognition"`.
 
-Nothing in `pipeline.py` needs to change. It reads whatever is in the prompt file.
+Expect the excluded rows to be a large share of the corpus. Clinical documentation
+alone -- every ED note, handoff and consult request -- now falls outside the 12,
+where the 17-task version routed it to task 13.
 
----
+If you edit the task list again, three things have to move together: the task
+definitions, every `task N` cross-reference in the guardrails and boundary lines,
+and the `1-12` range in the output format at the bottom. Nothing in `pipeline.py`
+needs to change -- it reads whatever is in the prompt file.
 
 ## Things to be aware of
 
@@ -121,12 +130,18 @@ They got 73.5% using gpt-4.1. If you use a different model you cannot lean on th
 number. Run the same check on both layers, with different reviewers for each, as
 they did. `queries_labeled.csv` is what you sample from.
 
-**Watch the 3 / 7 / 8 confusion.** The cognitive prompt says so itself: getting
-information, trusting it, and interpreting it absorb most of the corpus and most of
-the misclassification. When you review the 100, check that confusion specifically
-rather than just the overall agreement rate.
+**Watch the 3 vs 7 confusion.** The cognitive prompt says so itself: gathering
+information and interpreting it absorb most of the corpus and most of the
+misclassification. In the 12-task numbering those are task 3 and task 7. The third
+member of that old trio -- trusting the information -- is now outside the 12, so
+also check that credibility queries are landing at 0 rather than being quietly
+pulled into 3 or 7.
 
----
+**Reruns reuse old labels, silently.** `cache_*.jsonl` is keyed on query text alone
+and records nothing about which prompt or model produced the answer. Rerunning into
+an output directory from before the 12-task switch will hand back the old 17-task
+labels and print "labeling 0 new queries" as though all is well. Use a fresh
+`--outdir` whenever the prompt or the model changes.
 
 ## What this does not include
 
