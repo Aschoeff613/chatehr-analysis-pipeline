@@ -67,11 +67,12 @@ CONCURRENCY = 8
 # Rows whose reply could not be parsed are reported under this label rather
 # than dropped, so every distribution sums to the number of queries.
 UNLABELED = "(unlabeled: no valid reply)"
-FIT_STATUSES = ("matched", "no_adequate_fit", "insufficient_context", "nonclinical")
+# A request either maps to one of the 12 or it does not. One bucket, so the
+# share that does not map is a single readable number. The rationale field
+# carries the reason in plain words for anyone reviewing a row.
+FIT_STATUSES = ("matched", "does_not_map")
 STATUS_LABELS = {
-    "no_adequate_fit": "(no adequate taxonomy fit)",
-    "insufficient_context": "(insufficient context)",
-    "nonclinical": "(nonclinical)",
+    "does_not_map": "(does not map to the 12)",
     "invalid_response": UNLABELED,
 }
 VALIDATION_VERSION = 1
@@ -311,11 +312,13 @@ def validate_reply(reply: str, label: str, prompt_text: str) -> dict:
                 raise ValueError("Task ID/name mismatch")
         elif data["task_id"] is not None or data["cognitive_task"] is not None:
             raise ValueError("Unmatched requests cannot receive a task")
-        if status in ("matched", "no_adequate_fit"):
+        if status == "matched":
             if data["inference_depth"] not in ("surface", "one_step"):
                 raise ValueError("Invalid inference depth")
-        elif data["inference_depth"] is not None:
-            raise ValueError("Unknown/nonclinical cognition requires null depth")
+        elif data["inference_depth"] not in ("surface", "one_step", None):
+            # A request that does not map may still show an identifiable
+            # cognitive need, so depth is optional rather than forbidden.
+            raise ValueError("Invalid inference depth")
         if not isinstance(data["rationale"], str) or not data["rationale"].strip():
             raise ValueError("Missing rationale")
         if data["memo"] is not None and not isinstance(data["memo"], str):
@@ -360,7 +363,6 @@ def cognitive_results(queries, cache, prompt_text):
             "cognitive_fit_status": status,
             "cognitive_task_id": data.get("task_id"),
             "cognitive_task": data.get("cognitive_task"),
-            "cognitive_catalog_match": status == "matched" if status in ("matched", "no_adequate_fit") else None,
             "cognitive_outcome": data.get("cognitive_task") if status == "matched" else STATUS_LABELS[status],
             "inference_depth": data.get("inference_depth"),
             "cognitive_rationale": data.get("rationale"),
@@ -368,18 +370,17 @@ def cognitive_results(queries, cache, prompt_text):
         })
     result = pd.DataFrame(rows)
     result["cognitive_task_id"] = result["cognitive_task_id"].astype("Int64")
-    result["cognitive_catalog_match"] = result["cognitive_catalog_match"].astype("boolean")
     return result
 
 
 def cognitive_summary(statuses):
     counts = statuses.value_counts().to_dict()
-    assessable = counts.get("matched", 0) + counts.get("no_adequate_fit", 0)
+    classified = counts.get("matched", 0) + counts.get("does_not_map", 0)
     return {
         "cognitive_status_counts": {key: int(counts.get(key, 0)) for key in (*FIT_STATUSES, "invalid_response")},
-        "cognitive_assessable_clinical_queries": assessable,
-        "cognitive_taxonomy_coverage_pct": round(100 * counts.get("matched", 0) / assessable, 1) if assessable else None,
-        "cognitive_coverage_denominator": "matched + no_adequate_fit; excludes insufficient_context, nonclinical, invalid_response",
+        "cognitive_classified_queries": classified,
+        "cognitive_taxonomy_coverage_pct": round(100 * counts.get("matched", 0) / classified, 1) if classified else None,
+        "cognitive_coverage_denominator": "matched + does_not_map, i.e. every query that got a valid reply; excludes only technical failures",
         "cognitive_unlabeled": int(counts.get("invalid_response", 0)),
     }
 

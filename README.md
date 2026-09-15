@@ -36,39 +36,45 @@ python -m pytest tests/ -q
 Input is CSV or JSON with one request per row. Extra columns are carried through:
 include source platform/model, session ID, department, role, and date when available.
 Conversation mode extracts user turns using speaker-label heuristics. It does not
-retain preceding context for classification; ambiguous follow-ups may therefore
-receive insufficient_context. Audit transcript extraction before a study, since
+retain preceding context for classification, so an ambiguous follow-up is judged on
+its own text alone and will often not map. Audit transcript extraction before a study, since
 clinical headings can resemble speaker labels. Prefer structured exports with one
 request per row. Repeated identical request text reuses the same annotation.
 
 ## Deductive classification: assess the existing taxonomy
 
-The prompt defines the final 12 Delphi-selected tasks, numbered 1–12. A request
-receives a task only when the definition adequately fits its primary cognitive
-need. There is no closest-task assignment and no predefined list of excluded
-cognitive drivers.
+The prompt defines the final 12 Delphi-selected tasks, numbered 1-12. A request gets
+a task only when one of the definitions adequately fits the primary cognitive need
+its text actually shows. Nothing is forced to the closest task.
 
 | cognitive_fit_status | Meaning | Task ID/name |
 |---|---|---|
-| matched | The expressed primary need fits a task | Defined ID and name |
-| no_adequate_fit | An identifiable clinical cognitive need does not fit any task | Empty |
-| insufficient_context | The cognitive need or primary task cannot be determined | Empty |
-| nonclinical | Clearly only nonclinical/administrative work | Empty |
-| invalid_response | No valid classification after retries | Empty |
+| matched | One definition adequately fits | Defined ID and name |
+| does_not_map | It does not | Empty |
+| invalid_response | No valid reply after retries | Empty |
 
-A rationale explains the assignment, mismatch, or missing evidence. Memo is an
-optional review note; it never determines fit status. A bare clinical note request
-is insufficient_context; explicit selection of relevant information can support
-task 3. Pure formatting is nonclinical. Uncertainty is not counted as a taxonomy gap.
+Everything that is not a match lands in one bucket, whatever the reason: no
+definition fits, the request is too thin to show which need is driving it, or it is
+not clinical work at all. The rationale says which of those it was, in plain words,
+so a reviewer can read any row and see why. That keeps the reason available without
+turning it into a category to be counted, and keeps the headline number simple.
 
-The row-level cognitive_catalog_match column is true for matched, false for
-no_adequate_fit, and empty for other statuses. The task name remains empty for
-unassigned rows; cognitive_outcome provides readable status labels for tables.
+A bare clinical note request does not map, since "generate the ED note" does not by
+itself show a cognitive need. Explicit selection of relevant clinical information
+can support task 3.
 
-**Taxonomy coverage** is matched / (matched + no_adequate_fit). The summary records
-this denominator and all five status counts. Coverage is null when no requests are
-assessable. Report missing-context, nonclinical, and technical-failure counts too;
-coverage remains a classifier estimate pending human validation.
+`cognitive_outcome` is the column to group and cross-tabulate on: the task name for
+matched rows, a readable bucket label otherwise. `cognitive_task` and
+`cognitive_task_id` are empty for anything that did not map.
+
+**Taxonomy coverage** is matched over every request that got a valid reply. Only
+technical failures are outside the denominator, and the summary records the
+denominator and all three counts. Coverage is null when nothing was classified.
+
+Coverage is a classifier estimate until humans check it. Sample from
+`queries_labeled.csv` and have reviewers judge both the assigned tasks and a sample
+of the does-not-map bucket -- the second is the one that decides your coverage
+figure, so it is worth checking that the model is not parking genuine matches there.
 
 ## Inductive classification: describe the observed operations
 
@@ -95,7 +101,7 @@ validation. Both calls use the same classifier model and may share biases.
 | distribution_medical.csv | Medical label/group counts |
 | distribution_cognitive.csv | Matched task counts plus separate unassigned/error outcomes |
 | distribution_cognitive_fit.csv | All five deductive statuses, with percentages of all requests |
-| distribution_inductive.csv | Primary intent/group counts plus separate nonclinical/context/error outcomes |
+| distribution_inductive.csv | Primary intent/group counts plus separate nonclinical/context/error outcomes (the inductive pass keeps its own outcomes; it has no task list) |
 | crosstab_medical_x_cognitive.csv | Medical work versus deductive outcomes |
 | crosstab_inductive_x_cognitive.csv | Exploratory theme/intent versus deductive outcomes |
 | run_summary.json | Settings, prompt hashes, counts, coverage denominator, grouping details |
@@ -132,14 +138,20 @@ threshold is an assumption, not a parameter reported by the paper. Merges are
 transitive and can combine distinct labels; review cluster membership and assess
 sensitivity before interpreting grouped distributions.
 
-## Migration from forced fits
+## Migration from earlier versions
 
-The cognitive_forced_fit column and cognitive_natural_fit_pct /
-cognitive_forced_fit_pct summary fields are removed. Use cognitive_fit_status and
-cognitive_taxonomy_coverage_pct instead. Nonclinical requests no longer use task ID
-0; every unassigned task has a null ID and name. Existing scripts expecting complete
-task columns or the old coverage denominator must be updated. Inductive responses
-now include insufficient_context. Prompt changes invalidate prior annotations.
+Earlier revisions assigned a closest task and recorded a `cognitive_forced_fit`
+column, with `cognitive_natural_fit_pct` and `cognitive_forced_fit_pct` in the
+summary. A later revision split non-matches into `no_adequate_fit`,
+`insufficient_context` and `nonclinical`, and carried a derived
+`cognitive_catalog_match` column. All of those are gone. There are now two
+classification outcomes, `matched` and `does_not_map`, plus `invalid_response` for
+technical failures.
+
+Nonclinical requests no longer use task ID 0; anything unassigned has a null ID and
+name. Scripts expecting complete task columns, the old statuses, or the old coverage
+denominator need updating. Any prompt change invalidates cached annotations, which
+the cache detects on its own.
 
 ## Before interpreting a study
 

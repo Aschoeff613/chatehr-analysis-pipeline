@@ -15,7 +15,7 @@ import pipeline as p
 def cognitive(status="matched", **changes):
     data = dict(fit_status=status, task_id=3 if status == "matched" else None,
                 cognitive_task="Directed information gathering & sufficiency" if status == "matched" else None,
-                inference_depth="surface" if status in ("matched", "no_adequate_fit") else None,
+                inference_depth="surface",
                 rationale="Synthetic annotation for testing.", memo=None)
     data.update(changes)
     return json.dumps(data)
@@ -35,9 +35,10 @@ def test_valid_statuses(status):
 
 @pytest.mark.parametrize("reply", ["[]", "null", "true", "1", "{}", "not json", "",
     cognitive(task_id=99), cognitive(task_id=True), cognitive(task_id="3"),
-    cognitive(cognitive_task="Invented name"), cognitive("no_adequate_fit", task_id=3),
-    cognitive("insufficient_context", inference_depth="surface"), cognitive(rationale=""),
-    cognitive("forced_fit")])
+    cognitive(cognitive_task="Invented name"), cognitive("does_not_map", task_id=3),
+    cognitive("does_not_map", cognitive_task="Directed information gathering & sufficiency"),
+    cognitive("does_not_map", inference_depth="guessing"), cognitive(rationale=""),
+    cognitive("forced_fit"), cognitive("no_adequate_fit"), cognitive("nonclinical")])
 def test_invalid_cognitive_replies(reply):
     with pytest.raises(ValueError):
         p.validate_reply(reply, "cognitive", p.PROMPT_COGNITIVE.read_text())
@@ -56,19 +57,38 @@ def test_inductive_rejects_string_booleans_and_conflicting_intents():
             p.validate_reply(json.dumps(data), "inductive", p.PROMPT_INDUCTIVE.read_text())
 
 
-def test_coverage_and_missing_tasks_are_distinct():
+def test_only_matched_rows_carry_a_task():
     statuses = list(p.FIT_STATUSES)
     cache = {status: cognitive(status, memo="arbitrary review note") for status in statuses}
-    df=p.cognitive_results(statuses+["failed"], cache, p.PROMPT_COGNITIVE.read_text())
+    df = p.cognitive_results(statuses + ["failed"], cache, p.PROMPT_COGNITIVE.read_text())
     assert df.cognitive_task_id.notna().sum() == 1
     assert df.cognitive_task.notna().sum() == 1
-    assert df.cognitive_catalog_match.isna().sum() == 3
-    summary=p.cognitive_summary(df.cognitive_fit_status)
-    assert summary["cognitive_taxonomy_coverage_pct"] == 50
-    assert summary["cognitive_assessable_clinical_queries"] == 2
+    # matched name, the does-not-map bucket, and the technical-failure bucket
+    assert len(set(df.cognitive_outcome)) == 3
+
+
+def test_coverage_counts_every_query_that_got_an_answer():
+    statuses = ["matched", "matched", "matched", "does_not_map", "failed"]
+    cache = {"matched": cognitive(), "does_not_map": cognitive("does_not_map")}
+    df = p.cognitive_results(statuses, cache, p.PROMPT_COGNITIVE.read_text())
+    summary = p.cognitive_summary(df.cognitive_fit_status)
+    # 3 matched of 4 that were classified; the technical failure is excluded
+    assert summary["cognitive_classified_queries"] == 4
+    assert summary["cognitive_taxonomy_coverage_pct"] == 75.0
     assert summary["cognitive_unlabeled"] == 1
-    assert len(set(df.cognitive_outcome)) == 5
-    assert p.cognitive_summary(pd.Series(["insufficient_context"]))["cognitive_taxonomy_coverage_pct"] is None
+
+
+def test_coverage_is_null_when_nothing_was_classified():
+    assert p.cognitive_summary(pd.Series(["invalid_response"]))[
+        "cognitive_taxonomy_coverage_pct"
+    ] is None
+
+
+def test_a_query_that_does_not_map_may_still_report_depth():
+    text = p.PROMPT_COGNITIVE.read_text()
+    for depth in ("surface", "one_step", None):
+        out = p.validate_reply(cognitive("does_not_map", inference_depth=depth), "cognitive", text)
+        assert out["task_id"] is None
 
 
 def fake_client(replies):
@@ -116,8 +136,7 @@ def test_full_pipeline_status_counts_and_independent_induction(tmp_path,monkeypa
             return {q:cognitive(q) for q in statuses[:-1]}
         if label == "medical":
             return {q:"Review history" for q in statuses[:-1]}
-        return {"matched":inductive(),"no_adequate_fit":inductive(),
-                "nonclinical":inductive("nonclinical"),"insufficient_context":inductive("insufficient_context")}
+        return {"matched":inductive(),"does_not_map":inductive("nonclinical")}
     monkeypatch.setattr(p,"run_layer",layer)
     monkeypatch.setattr(p,"embed",lambda labels: pytest.fail("One unique valid label needs no embeddings"))
     dest=tmp_path/'output'
@@ -126,15 +145,17 @@ def test_full_pipeline_status_counts_and_independent_induction(tmp_path,monkeypa
     assert calls == [(label,statuses) for label in ("medical","cognitive","inductive")]
     df=pd.read_csv(dest/'queries_labeled.csv')
     assert df.cognitive_task.notna().sum() == 1
-    assert len(set(df.inductive_group)) == 4
     for name in ("medical","cognitive","cognitive_fit","inductive"):
         d=pd.read_csv(dest/f'distribution_{name}.csv')
-        assert d.n_queries.sum() == 5
+        assert d.n_queries.sum() == len(statuses)
         assert d.pct_of_queries.sum() == pytest.approx(100)
     cross=pd.read_csv(dest/'crosstab_inductive_x_cognitive.csv',index_col=0)
-    assert cross.to_numpy().sum() == 5
+    assert cross.to_numpy().sum() == len(statuses)
     summary=json.loads((dest/'run_summary.json').read_text())
     assert summary["cognitive_taxonomy_coverage_pct"] == 50
+    assert summary["cognitive_status_counts"] == {"matched":1,"does_not_map":1,"invalid_response":1}
+    # the inductive pass keeps its own outcomes, independent of the 12
+    assert summary["inductive_status_counts"]["nonclinical"] == 1
     assert summary["inductive_status_counts"]["invalid_response"] == 1
     assert summary["medical_unlabeled"] == 1
 
