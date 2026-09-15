@@ -103,9 +103,17 @@ counts as its own row in `distribution_cognitive.csv` rather than being absorbed
 into a surviving task. Billing lookups and software troubleshooting still get
 `"System operation, not clinical cognition"`.
 
-Expect the excluded rows to be a large share of the corpus. Clinical documentation
-alone -- every ED note, handoff and consult request -- now falls outside the 12,
-where the 17-task version routed it to task 13.
+Document generation is handled separately, and not as a cognitive task. The medical
+layer already records which document was asked for, so on the cognitive layer a bare
+"generate the ED note" is labeled `"Document production, not clinical cognition"`.
+The 17-task version routed documentation to team and distributed cognition on the
+argument that a note transmits clinical state across providers; that does not hold
+against the construct as defined, which requires trust, delegation or responsibility
+to be at issue. A document request that specifies what to include and why goes to
+task 3, since the provider did the selection.
+
+Expect the excluded and non-cognitive rows together to be a large share of the
+corpus.
 
 If you edit the task list again, three things have to move together: the task
 definitions, every `task N` cross-reference in the guardrails and boundary lines,

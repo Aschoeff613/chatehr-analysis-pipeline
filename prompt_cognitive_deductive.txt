@@ -7,10 +7,12 @@ Identify WHY the provider is asking, not WHAT they are asking about. The same co
 The 12 tasks below are the final Delphi-selected set, ordered by composite rank. They are not exhaustive of clinical cognition. Five constructs that appeared in the earlier 17-task version were deliberately excluded, and a substantial share of real queries will fall outside the 12. Do not force those into the nearest surviving task. Label them 0 and name the construct, as described under "Queries outside the 12" below.
 
 # Guardrails
-- Surface phrasing does not determine the task. "Summarize this patient" is task 3 when the provider is pulling together what they need in order to act. It is task 9 when the summary is for the patient. It is outside the 12 when the summary's function is a handoff, consult, or care transition.
+- Surface phrasing does not determine the task. "Summarize this patient" is task 3 when the provider is pulling together what they need in order to act. It is task 9 when the summary is for the patient. It is outside the 12 when the request is to produce the handoff or consult document itself.
 - Getting information is task 3 and interpreting it is task 7. These two absorb most of this corpus and most of the misclassification. Judging whether the information can be trusted is outside the 12; label it 0 rather than forcing it into 3 or 7.
 - Chart lookup is task 3. Medical knowledge, rule, and criterion lookup is task 5. The distinction is whether the answer lives in this patient's record or outside it.
-- Note and document generation is outside the 12. The function of clinical documentation is transmitting clinical state across providers and time, which is the excluded team and distributed cognition construct. Label it 0, name that construct, and note "clinical documentation" in the memo. This is expected to be a large share of the corpus, so keeping it countable matters more here than anywhere else.
+- Generating a note or document is not itself a cognitive task. It is a medical-layer task, already captured there by "Generate emergency department notes", "Generate discharge summaries" and the rest of the C.1 documentation family. On this layer a bare request to produce a document has no clinical cognitive driver: the provider is offloading production, not reasoning. Label it 0 as "Document production, not clinical cognition". Do not read it as team and distributed cognition, which requires trust, delegation or responsibility to be at issue.
+- The exception is a document request that specifies what to include and why, where the provider has done the selection ("summarize her ICU course with the active issues, we are coming off the Clevidipine"). There the cognitive driver is deciding what is relevant and sufficient, which is task 3. Producing the artifact is incidental.
+- Naming the recipient does not make a document request team cognition. "Generate the ED note for handoff to the overnight team" names a document type and an audience; nothing is being entrusted or delegated. Reasoning about what the receiving team needs to know, whether a colleague can be relied on, or who carries responsibility is team and distributed cognition, and that is outside the 12.
 - An algorithm is a source. A query seeking context to evaluate an AI, CDS, or alert recommendation is a credibility judgment and is outside the 12. Label it 0 and note "automation bias" in the memo so these stay countable.
 - Therapeutic selection and titration is task 8, since choosing, escalating, or deprescribing is committing to a plan. Retrieving the dose, rule, or interval that informs the choice is task 5.
 - Reconstructing why an absent clinician decided something is outside the 12, even though the evidence is in the chart. The object is what another person was thinking. Label it 0 rather than defaulting to task 3.
@@ -24,11 +26,12 @@ Set "task_id" to 0 and "catalog_match" to false, and set "cognitive_task" to exa
 Excluded clinical cognition (these are real cognitive work, just not in the final 12):
 - "Outside the 12: Managing uncertainty" — explicitly naming what is unknown and choosing a step that tolerates or resolves it, including safety-netting and return precautions.
 - "Outside the 12: Judging credibility & completeness" — whether incoming information can be trusted, whether to verify it first-hand, and whether something is missing. Includes evaluating an algorithm, alert, or outside record as a source.
-- "Outside the 12: Team & distributed cognition" — reasoning about or through other people: handoff, consult, delegation, trusting a colleague, coordinating services, reconstructing another clinician's reasoning, and clinical documentation.
+- "Outside the 12: Team & distributed cognition" — reasoning about or through other people: how far to trust a colleague, what to hand over versus keep, checking someone else's plan, who carries responsibility, coordinating with other services, confirming a shared mental model at handoff, and reconstructing why an absent clinician decided something. Trust, delegation or responsibility must actually be at issue.
 - "Outside the 12: Metacognitive self-regulation" — the clinician monitoring their own reasoning, confidence, bias, attention, or memory.
 - "Outside the 12: Encounter scoping" — fixing what this contact is for and which problems it will carry.
 
 Not clinical cognition at all:
+- "Document production, not clinical cognition" — a request to generate a note, summary, letter or report where the provider has not specified what to include or why. The medical layer already records which document was asked for.
 - "System operation, not clinical cognition" — billing and coding lookups, software troubleshooting, work queue mechanics, non-clinical administrative requests.
 
 Use the memo field to add detail, but the "cognitive_task" string must match one of the above exactly so these remain countable in the distribution.
@@ -116,7 +119,7 @@ Boundary: Not a diagnosis and not an action. If the case forces a differential i
   "catalog_match": <true | false>,
   "inference_depth": "<surface | one_step>",
   "rationale": "<1 sentence explaining the cognitive driver>",
-  "memo": "<null, or a short note: construct misfit, automation bias, clinical documentation, single-patient closure verification, or genuine two-task conflict>"
+  "memo": "<null, or a short note: construct misfit, automation bias, document type requested, single-patient closure verification, or genuine two-task conflict>"
 }
 
 # Current Task
